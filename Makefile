@@ -8,11 +8,10 @@ SHELL := /bin/bash
 MODEL              ?= llama3.2:1b
 OLLAMA_BASE        ?= http://localhost:11434
 SUBSTRATE_BASE     ?= https://mq.connected-cloud.io/v1
-ROUTER_URL         ?= http://localhost:3000
-# Default presence URL assumes the substrate can reach your local router.
-# For a real run, expose the router (e.g. ngrok / Akamai property / public LKE ingress)
-# and override this on the bootstrap-substrate target.
+ROUTER_URL         ?= https://inference.connected-cloud.io
 ROUTER_PRESENCE_URL ?= $(ROUTER_URL)/v1/internal/presence
+# Direct-to-FWF override for debugging the router without Akamai in the path:
+#   make smoke ROUTER_URL=https://8f12a91f-9352-4ce0-8935-a2717dcab981.fwf.app
 
 .PHONY: help
 help:
@@ -42,6 +41,16 @@ run-router: build-router  ## Run router locally with `spin up`
 	cd router && spin up \
 	  --variable tenant_bearer="$$(cat ../.tenant-bearer | tr -d '[:space:]')" \
 	  --variable substrate_base="$(SUBSTRATE_BASE)"
+
+.PHONY: deploy-router
+deploy-router:  ## Deploy router to Akamai Functions (FWF) as app 'inference-router'
+	cd router && spin aka deploy --from . --build --create-name inference-router \
+	  --variable tenant_bearer="$$(cat ../.tenant-bearer | tr -d '[:space:]')" \
+	  --no-confirm
+
+.PHONY: router-logs
+router-logs:  ## Tail logs from the deployed router
+	spin aka logs --app-name inference-router --follow
 
 .PHONY: run-worker
 run-worker: build-worker  ## Run a worker pointing at local Ollama

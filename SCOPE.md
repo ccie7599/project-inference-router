@@ -16,7 +16,7 @@ Show that a customer can keep their inference runtime under their own control wh
 - [x] Substrate wire shapes validated against the live service (`docs/validation.md`)
 - [ ] One inference worker class running end-to-end: local Ollama (`llama3.2:1b`)
 - [ ] Request router as a Spin function on FWF (Rust, `wasm32-wasip1`)
-- [ ] Hostname routed via Akamai (`inference.connected-cloud.io`) — deferred to deploy step
+- [x] Hostname routed via Akamai (`inference.connected-cloud.io`) — Akamai property prp_1362578, edge hostname `inference.connected-cloud.io.edgekey.net` (ehn_6162181, ENHANCED_TLS via CPS enrollment 293468 SAN cert), CNAME live in Edge DNS, activation pending at time of doc
 - [ ] req/res response shape working end-to-end (router collects SSE, returns JSON)
 - [ ] streaming-tokens response shape working end-to-end (router 302s to substrate SSE)
 - [ ] Worker presence in Spin KV, refreshed via http_push subscription on `worker.presence` topic
@@ -51,8 +51,8 @@ Resolved for v0.1:
 - ~~Presence?~~ → **Topic heartbeat → http_push subscription → Spin KV** (see ADR-002).
 
 Still open:
-- Should this project own its own Akamai property + cert, or piggyback on existing `connected-cloud.io` infra? (Deploy-step decision.)
-- Where does the demo land — public-facing on `connected-cloud.io`, internal-only, or tagged tenant in the nats-mq UI?
+- ~~Own Akamai property + cert vs piggyback?~~ → **Own property** `inference.connected-cloud.io` (prp_1362578), SAN cert reused from CPS enrollment 293468 (covers sse + 23 other hostnames). See ADR-003.
+- ~~Where does the demo land?~~ → **Public-facing** at `https://inference.connected-cloud.io/`.
 
 ## Tier-2 graduation triggers (when this stops being a POC)
 

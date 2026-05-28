@@ -51,3 +51,26 @@ Architecture Decision Records. Add one entry per non-trivial choice.
 - Single shared response queue with corr_id in body: rejected — consume-once semantics race across in-flight requests.
 - Workers HTTP-POST presence to router: rejected — user picked topic-based; topic also gives observability for free.
 - TypeScript Spin function: rejected — Brian prefers Rust for performance-sensitive code; router IS the front-door.
+
+## ADR-003: v0.1 deploy shape — own Akamai property, SAN cert reuse, region-less FWF
+**Status**: accepted
+**Date**: 2026-05-28
+**Context**: Need a public-facing demo URL. SCOPE.md left "own property vs piggyback" and "public vs internal" open.
+**Decision**:
+- **Public-facing** at `https://inference.connected-cloud.io/` (resolves via Edge DNS CNAME → `inference.connected-cloud.io.edgekey.net`).
+- **Dedicated Akamai property** `inference.connected-cloud.io` (prp_1362578, contract `ctr_M-1YX7F61`, group `grp_203183` (IOT), product `prd_SPM` (Ion Premier), ruleFormat `latest`). Cloned from sse.connected-cloud.io (prp_1318033) v28 as a starting point. Patches: dropped "Token Auth Gate" (public access), dropped "SSE Streaming" (its nested origin pointed at sse's H2 backend, irrelevant here), dropped the DataStream behavior (stream wasn't accessible to this tenant — to be re-added separately once a CP code mapping is sorted).
+- **TLS via SAN cert reuse**: Edge hostname `inference.connected-cloud.io.edgekey.net` (ehn_6162181, ENHANCED_TLS). Cert from CPS enrollment **293468** — Let's Encrypt DV SAN cert with CN `sse.connected-cloud.io` and 24 other SANs. `inference.connected-cloud.io` was already on that SAN list, so no enrollment update / DNS-01 dance was needed.
+- **FWF origin**: `<app-id>.fwf.app` URL emitted by `spin aka deploy`. FWF is region-less, so no region pick. Property's default origin behavior uses `forwardHostHeader: ORIGIN_HOSTNAME` so the FWF app routes by Host header correctly.
+- **Tooling**: PAPI / CPS / Edge DNS via direct curl with EdgeGrid signing (Python helper). Not Terraform-managed for v0.1 — the gain (one property, one DNS record, reused cert) is small vs. the setup cost. If a second property class shows up, revisit Terraforming via the Akamai provider.
+**Rationale**:
+- Own property gives a clean independent activation lifecycle (don't have to bundle inference changes with sse releases).
+- SAN-cert reuse avoids a multi-hour cert issuance + DNS-01 cycle.
+- IOT group + Ion Premier product mirror sse, so behaviors + features available are identical and the clone-then-strip path was straightforward.
+**Consequences**:
+- Activation happens via direct PAPI calls — the activation record is captured here but the rule tree itself only lives in `prp_1362578` on Akamai. If we ever need to recreate, the procedure is in this ADR's bullets.
+- Property is open (no token gate). For demo. v0.2 may need an ACL if we don't want random callers warming up workers.
+- Cert SAN list now used by both this property and the others sharing enrollment 293468; lifecycle (renewal, rotation) is shared and not project-scoped.
+**Alternatives considered**:
+- Issue a new dedicated DV cert for `inference.connected-cloud.io`: rejected — slower, doesn't reuse existing infra.
+- Piggyback on existing sse.connected-cloud.io property under a path: rejected — couples release cadence to sse and forces both apps to share the gate / SureRoute config.
+- Terraform the whole thing: deferred to when a second property is needed in this project.

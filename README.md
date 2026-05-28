@@ -2,7 +2,10 @@
 
 Edge-native distributed inference router. Akamai CDN + FWF function as the request router + Akamai Cloud Queues + Notifications (`mq.connected-cloud.io`) for the work fabric + heterogeneous customer-owned inference workers connected via NATS.
 
-**Status**: v0.1 scaffold landed (router + worker + bootstrap) — needs end-to-end smoke run against the live substrate.
+**Status**: router deployed to FWF + Akamai property `inference.connected-cloud.io` (prp_1362578) cut over to it. Worker is BYO (run `make run-worker` anywhere with reachable network). End-to-end requires the worker running.
+
+**Public URL**: `https://inference.connected-cloud.io/`
+**FWF origin** (direct, for debugging): `https://8f12a91f-9352-4ce0-8935-a2717dcab981.fwf.app/`
 
 **Started from**: a "what could we build as a reference app on Akamai Cloud Queues + Notifications" conversation on 2026-05-28. The headline concept was already sketched in `project-nats-mq/SCOPE.md` §426 — that text is preserved here in `docs/concept.md`.
 

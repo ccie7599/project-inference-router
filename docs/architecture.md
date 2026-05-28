@@ -5,12 +5,27 @@ Concrete wire protocol for the v0.1 cut. Substrate behavior validated live on 20
 ## Components
 
 ```
-┌────────────────────┐    POST /v1/inference     ┌────────────────────┐
-│  Client (browser   │ ─────────────────────────▶│  Router            │
-│  or curl)          │                            │  Spin function on  │
-│                    │ ◀───── 302 (stream)        │  FWF (Rust)        │
-│                    │       or  200 JSON         │                    │
-└────────────────────┘                            └─────────┬──────────┘
+┌────────────────────┐
+│  Client (browser   │
+│  or curl)          │
+└─────────┬──────────┘
+          │ POST https://inference.connected-cloud.io/v1/inference
+          ▼
+┌────────────────────────────────────────────┐
+│  Akamai property inference.connected-cloud │
+│  Ion Premier (prp_1362578); SAN cert from  │
+│  CPS enrollment 293468                     │
+└─────────┬──────────────────────────────────┘
+          │ HTTPS to origin <app-id>.fwf.app
+          ▼
+┌────────────────────┐
+│  Router            │
+│  Spin function on  │
+│  FWF (Rust)        │
+│                    │
+│                    │ ◀───── 302 (stream)
+│                    │       or  200 JSON
+└─────────┬──────────┘
         ▲                                                   │
         │ SSE (streaming case only,                         │ HTTP
         │ direct to substrate, bypasses FWF)                │
