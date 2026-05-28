@@ -1,0 +1,21 @@
+[Unit]
+Description=Inference router worker (Ollama-backed)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/project-inference-router
+Environment=RUST_LOG=worker=info,reqwest=warn
+Environment=MODEL=llama3.2:1b
+Environment=OLLAMA_BASE=http://localhost:11434
+Environment=REGION=claudebot-cpu
+Environment=SUBSTRATE_BASE=https://mq.connected-cloud.io/v1
+ExecStart=%h/project-inference-router/worker/target/release/worker
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

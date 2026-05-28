@@ -59,11 +59,29 @@ You should see the req/res JSON response in stdout, and then a streaming SSE fee
 ## Layout
 
 ```
-router/   Spin function (Rust, wasm32-wasip1) — the request router
-worker/   Native Rust binary — Ollama-backed inference worker
-docs/     concept.md, architecture.md, using-nats-mq.md
-scripts/  bootstrap-substrate.sh, smoke.sh
+router/           Spin function (Rust, wasm32-wasip1) — the request router
+worker/           Native Rust binary — Ollama-backed inference worker
+docs/             concept.md, architecture.md, validation.md, using-nats-mq.md
+scripts/          bootstrap-substrate.sh, smoke.sh, janitor.sh
+deploy/systemd/   systemd user units for worker + janitor.timer
 ```
+
+## Persistent worker (systemd user units)
+
+```bash
+# install
+ln -sf "$PWD/deploy/systemd"/*.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now inference-router-worker.service
+systemctl --user enable --now inference-router-janitor.timer
+
+# observe
+systemctl --user status inference-router-worker.service
+journalctl --user -u inference-router-worker.service -f
+systemctl --user list-timers | grep inference
+```
+
+The worker reads `.tenant-bearer` from the project root, so it picks up the bearer without anything in the unit file. `loginctl enable-linger $USER` makes user units persist across logout (already on for this host).
 
 ## Pointers
 

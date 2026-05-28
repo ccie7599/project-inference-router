@@ -1,7 +1,7 @@
 # SCOPE — project-inference-router
 
 **Tier**: 1 (research POC / reference application).
-**Status**: v0.1 scope locked 2026-05-28.
+**Status**: v0.1 shipped + smoke green 2026-05-28. Public at `https://inference.connected-cloud.io/`.
 **Created**: 2026-05-28.
 
 This is a reference application demonstrating what's buildable on the Akamai Cloud Queues + Notifications platform. Audience for the finished demo: internal Fermyon + Akamai cloud architects/SMEs evaluating the platform.
@@ -14,13 +14,13 @@ Show that a customer can keep their inference runtime under their own control wh
 
 - [x] Architecture written up in `DECISIONS.md` (ADR-002) and `docs/architecture.md`
 - [x] Substrate wire shapes validated against the live service (`docs/validation.md`)
-- [ ] One inference worker class running end-to-end: local Ollama (`llama3.2:1b`)
-- [ ] Request router as a Spin function on FWF (Rust, `wasm32-wasip1`)
-- [x] Hostname routed via Akamai (`inference.connected-cloud.io`) — Akamai property prp_1362578, edge hostname `inference.connected-cloud.io.edgekey.net` (ehn_6162181, ENHANCED_TLS via CPS enrollment 293468 SAN cert), CNAME live in Edge DNS, activation pending at time of doc
-- [ ] req/res response shape working end-to-end (router collects SSE, returns JSON)
-- [ ] streaming-tokens response shape working end-to-end (router 302s to substrate SSE)
-- [ ] Worker presence in Spin KV, refreshed via http_push subscription on `worker.presence` topic
-- [ ] Smoke test script that exercises both shapes
+- [x] One inference worker class running end-to-end: local Ollama (`llama3.2:1b`) — worker on the claudebot box, CPU-only
+- [x] Request router as a Spin function on FWF (Rust, `wasm32-wasip1`) — app `inference-router`, edge URL `https://8f12a91f-9352-4ce0-8935-a2717dcab981.fwf.app`
+- [x] Hostname routed via Akamai (`inference.connected-cloud.io`) — property prp_1362578 v2, edge hostname `inference.connected-cloud.io.edgekey.net` (ehn_6162181, ENHANCED_TLS via CPS enrollment 293468 SAN cert)
+- [x] req/res response shape working end-to-end — router long-polls per-corr-id queue, worker dual-publishes
+- [x] streaming-tokens response shape working end-to-end — router 302s to substrate SSE
+- [x] Worker presence in Spin KV, refreshed via http_push subscription on `worker_presence` topic
+- [x] Smoke test script (`scripts/smoke.sh`) exercises both shapes — currently green
 
 Out of v0.1 (queued for v0.2):
 - Second worker class
