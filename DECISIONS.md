@@ -74,3 +74,27 @@ Architecture Decision Records. Add one entry per non-trivial choice.
 - Issue a new dedicated DV cert for `inference.connected-cloud.io`: rejected — slower, doesn't reuse existing infra.
 - Piggyback on existing sse.connected-cloud.io property under a path: rejected — couples release cadence to sse and forces both apps to share the gate / SureRoute config.
 - Terraform the whole thing: deferred to when a second property is needed in this project.
+
+## ADR-004: Skip ack + queue delete in the router; reap orphan queues externally
+**Status**: accepted (workaround pending upstream investigation)
+**Date**: 2026-05-28
+**Context**: First end-to-end smoke through Akamai → FWF → substrate consistently 500'd at the 30s wall-clock. Bisected by stripping calls: req/res returned correctly only after BOTH `ack` (DELETE on `/queues/<q>/messages/<token>`) and `delete_queue` (DELETE on `/queues/<q>`) were removed from the handler. Direct curl to the same endpoints returns 204 in ~100ms. Substrate is fine; the worker (using reqwest) does DELETEs all day.
+**Decision**:
+- The router does **not** ack response-queue messages and does **not** delete response queues. The response-queue path is shaped so neither matters for correctness: the queue is per-corr-id and the next request gets a fresh queue.
+- Unacked response-queue messages get DLQ'd after 5 redeliveries × 25 s ack_wait (~125 s); that's acceptable since nothing else is consuming.
+- Orphan response queues accumulate at the rate of one per req/res request. They're capped by the 50-queue tenant quota. `scripts/janitor.sh` reaps them from any host that has the bearer; intent is a cron / systemd timer on the worker host, every ~10 min.
+- Subscription create (POST) and topic publish (POST) work fine in Spin → FWF. Only outbound DELETE was observed to hang.
+**Rationale**:
+- The substrate's REST surface is otherwise sane and fast. Punishing this bug to figure out *why* Spin's DELETE hangs (a wasi-http vs server-side TLS-keepalive interaction? an empty-body content-length quirk? a Spin SDK 3.1 bug?) is a yak-shave we don't need to take for a v0.1 demo.
+- The workaround is contained: only ack + delete are skipped; everything else (presence, publish, receive, subscription create, 302 redirect) works as designed.
+**Consequences**:
+- Need an external janitor or things will pile up. Without it: at ~10 req/min sustained, the 50-queue quota is hit in ~5 minutes.
+- DLQ traffic for unacked response-queue messages adds substrate work. Doesn't affect correctness.
+- Streaming-shape requests are unaffected (no per-corr-id queue is created).
+**Open**:
+- Reproduce in a minimal Spin component and report upstream — `spin_sdk::http::send` with `Method::Delete` to a vanilla HTTPS endpoint, does it hang? If yes, file with Fermyon. If no, narrow further (TLS keepalive? response body framing?).
+- Try the lower-level `spin-sdk` outbound primitives instead of `http::send`.
+- Try issuing the DELETE as `POST` to a different route on the substrate if one exists (it doesn't today; would need substrate-side support).
+**Alternatives considered**:
+- Have the worker delete the response queue after publishing the final response. Cleaner architecturally but mixes concerns and still leaves ack on the router side. Worth doing once the upstream bug is investigated.
+- Pre-create a pool of response queues and round-robin them. Avoids per-request create but needs router-side state across invocations; not a fit for a stateless function.

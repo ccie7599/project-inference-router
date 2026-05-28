@@ -150,7 +150,9 @@ async fn handle_inference(req: Request) -> Result<Response> {
         return Err(e);
     }
     let received = receive_one(&cfg, &resp_queue, cfg.reqres_poll_secs).await;
-    let _ = delete_queue(&cfg, &resp_queue).await;
+    // Skip delete_queue: Spin SDK's outbound DELETE hangs in the FWF runtime
+    // (see ADR-004). Response queues are reaped externally — see scripts/janitor.sh
+    // and the worker host's `janitor` systemd timer in v0.2.
     match received {
         Ok(Some(body_bytes)) => Ok(Response::builder()
             .status(200)
@@ -209,7 +211,7 @@ async fn create_subscription(cfg: &Cfg, corr_id: &str) -> Result<String> {
         "filter": format!("inference.{}.>", corr_id),
         "delivery": {"type": "sse"}
     });
-    let resp = post_json(cfg, "/subscriptions", &body).await?;
+    let resp = post_json_retry(cfg, "/subscriptions", &body).await?;
     let parsed: SubscriptionCreated =
         serde_json::from_slice(&resp).context("subscription create response")?;
     Ok(parsed.id)
@@ -217,7 +219,7 @@ async fn create_subscription(cfg: &Cfg, corr_id: &str) -> Result<String> {
 
 async fn create_queue(cfg: &Cfg, name: &str) -> Result<()> {
     let body = serde_json::json!({ "name": name });
-    let _ = post_json(cfg, "/queues", &body).await?;
+    let _ = post_json_retry(cfg, "/queues", &body).await?;
     Ok(())
 }
 
@@ -227,6 +229,7 @@ async fn delete_queue(cfg: &Cfg, name: &str) -> Result<()> {
         .method(Method::Delete)
         .uri(url)
         .header("authorization", format!("Bearer {}", cfg.bearer))
+        .body(Vec::<u8>::new())
         .build();
     let _resp: Response = spin_sdk::http::send(req).await?;
     Ok(())
@@ -243,14 +246,16 @@ async fn publish_request(
     let item = WorkItem { corr_id, model, prompt, response_queue };
     let bytes = serde_json::to_vec(&item)?;
     let url = format!("{}/queues/{}/messages", cfg.base, queue);
-    let req = Request::builder()
-        .method(Method::Post)
-        .uri(url)
-        .header("authorization", format!("Bearer {}", cfg.bearer))
-        .header("content-type", "application/octet-stream")
-        .body(bytes)
-        .build();
-    let resp: Response = spin_sdk::http::send(req).await?;
+    let resp = send_retry_5xx(|| {
+        Request::builder()
+            .method(Method::Post)
+            .uri(url.clone())
+            .header("authorization", format!("Bearer {}", cfg.bearer))
+            .header("content-type", "application/octet-stream")
+            .body(bytes.clone())
+            .build()
+    })
+    .await?;
     let status: u16 = (*resp.status()).into();
     if status >= 300 {
         return Err(anyhow!(
@@ -272,6 +277,7 @@ async fn receive_one(cfg: &Cfg, queue: &str, wait_secs: u64) -> Result<Option<Ve
         .method(Method::Get)
         .uri(url)
         .header("authorization", format!("Bearer {}", cfg.bearer))
+        .body(Vec::<u8>::new())
         .build();
     let resp: Response = spin_sdk::http::send(req).await?;
     let status: u16 = (*resp.status()).into();
@@ -294,7 +300,10 @@ async fn receive_one(cfg: &Cfg, queue: &str, wait_secs: u64) -> Result<Option<Ve
     let body_bytes = base64::engine::general_purpose::STANDARD
         .decode(msg.body_b64.as_bytes())
         .context("body_b64 decode")?;
-    ack(cfg, queue, &msg.ack_token).await?;
+    // Skip ack: Spin SDK's outbound DELETE hangs in the FWF runtime (see ADR-004).
+    // The unacked message gets DLQ'd after 5 redeliveries × 25s ack_wait, which
+    // is harmless for a per-corr-id queue that the worker doesn't long-poll.
+    let _ = msg.ack_token;
     Ok(Some(body_bytes))
 }
 
@@ -304,6 +313,7 @@ async fn ack(cfg: &Cfg, queue: &str, ack_token: &str) -> Result<()> {
         .method(Method::Delete)
         .uri(url)
         .header("authorization", format!("Bearer {}", cfg.bearer))
+        .body(Vec::<u8>::new())
         .build();
     let resp: Response = spin_sdk::http::send(req).await?;
     let status: u16 = (*resp.status()).into();
@@ -318,17 +328,19 @@ async fn ack(cfg: &Cfg, queue: &str, ack_token: &str) -> Result<()> {
     Ok(())
 }
 
-async fn post_json(cfg: &Cfg, path: &str, body: &serde_json::Value) -> Result<Vec<u8>> {
+async fn post_json_retry(cfg: &Cfg, path: &str, body: &serde_json::Value) -> Result<Vec<u8>> {
     let url = format!("{}{}", cfg.base, path);
     let bytes = serde_json::to_vec(body)?;
-    let req = Request::builder()
-        .method(Method::Post)
-        .uri(url.clone())
-        .header("authorization", format!("Bearer {}", cfg.bearer))
-        .header("content-type", "application/json")
-        .body(bytes)
-        .build();
-    let resp: Response = spin_sdk::http::send(req).await?;
+    let resp = send_retry_5xx(|| {
+        Request::builder()
+            .method(Method::Post)
+            .uri(url.clone())
+            .header("authorization", format!("Bearer {}", cfg.bearer))
+            .header("content-type", "application/json")
+            .body(bytes.clone())
+            .build()
+    })
+    .await?;
     let status: u16 = (*resp.status()).into();
     if status >= 300 {
         return Err(anyhow!(
@@ -339,6 +351,21 @@ async fn post_json(cfg: &Cfg, path: &str, body: &serde_json::Value) -> Result<Ve
         ));
     }
     Ok(resp.body().to_vec())
+}
+
+/// Send a request, retrying once on 5xx responses (substrate has transient
+/// `context deadline exceeded` errors that cost ~5s each — more attempts
+/// would eat the FWF wall-clock budget).
+async fn send_retry_5xx<F>(mut build: F) -> Result<Response>
+where
+    F: FnMut() -> Request,
+{
+    let resp: Response = spin_sdk::http::send(build()).await?;
+    let status: u16 = (*resp.status()).into();
+    if status < 500 {
+        return Ok(resp);
+    }
+    Ok(spin_sdk::http::send(build()).await?)
 }
 
 fn text(status: u16, msg: &str) -> Response {

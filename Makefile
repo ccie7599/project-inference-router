@@ -70,6 +70,10 @@ bootstrap-substrate:  ## Create queues, topics, presence-collector sub on the su
 	ROUTER_PRESENCE_URL="$(ROUTER_PRESENCE_URL)" \
 	  bash scripts/bootstrap-substrate.sh
 
+.PHONY: janitor
+janitor:  ## Reap orphan inference_resp_* queues left behind by the router (see ADR-004)
+	bash scripts/janitor.sh
+
 .PHONY: list-substrate
 list-substrate:  ## List queues + subscriptions on the tenant
 	@BEARER="$$(cat .tenant-bearer | tr -d '[:space:]')"; \
