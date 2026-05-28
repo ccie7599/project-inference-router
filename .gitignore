@@ -1,0 +1,11 @@
+# Tenant bearer — keep out of git
+.tenant-bearer
+
+# Standard editor / build crud
+.DS_Store
+*.swp
+target/
+node_modules/
+.spin-aka/
+.spin/
+*.log

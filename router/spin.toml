@@ -1,0 +1,34 @@
+spin_manifest_version = 2
+
+[application]
+name = "inference-router"
+version = "0.1.0"
+authors = ["Brian Apley <brian@apley.net>"]
+description = "Edge-native inference router on Akamai Cloud Queues + Notifications"
+
+[variables]
+tenant_bearer    = { required = true }
+substrate_base   = { default = "https://mq.connected-cloud.io/v1" }
+default_region   = { default = "local-dev" }
+presence_max_age_secs = { default = "30" }
+reqres_poll_secs = { default = "25" }
+
+[[trigger.http]]
+route = "/..."
+component = "router"
+
+[component.router]
+source = "target/wasm32-wasip1/release/router.wasm"
+allowed_outbound_hosts = ["https://mq.connected-cloud.io"]
+key_value_stores = ["default"]
+
+[component.router.variables]
+tenant_bearer    = "{{ tenant_bearer }}"
+substrate_base   = "{{ substrate_base }}"
+default_region   = "{{ default_region }}"
+presence_max_age_secs = "{{ presence_max_age_secs }}"
+reqres_poll_secs = "{{ reqres_poll_secs }}"
+
+[component.router.build]
+command = "cargo build --target wasm32-wasip1 --release"
+watch = ["src/**/*.rs", "Cargo.toml"]
