@@ -1,10 +1,14 @@
 use anyhow::{anyhow, Context, Result};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use spin_sdk::http::{IntoResponse, Method, Request, Response};
 use spin_sdk::http_component;
 use spin_sdk::key_value::Store;
 use spin_sdk::variables;
 use uuid::Uuid;
+
+const RESPONSE_TOPIC: &str = "inference_responses";
+const SUBSTRATE_MAX_WAIT_SECS: u64 = 20;
 
 #[derive(Deserialize)]
 struct InferenceRequest {
@@ -45,9 +49,17 @@ struct SubscriptionCreated {
 }
 
 #[derive(Deserialize)]
-struct QueueReceiveResponse {
-    body: serde_json::Value,
+struct ReceiveResponse {
+    #[serde(default)]
+    count: u32,
+    #[serde(default)]
+    messages: Vec<ReceivedMessage>,
+}
+
+#[derive(Deserialize)]
+struct ReceivedMessage {
     ack_token: String,
+    body_b64: String,
 }
 
 struct Cfg {
@@ -59,6 +71,12 @@ struct Cfg {
 
 impl Cfg {
     fn load() -> Result<Self> {
+        let mut poll: u64 = variables::get("reqres_poll_secs")?
+            .parse()
+            .context("reqres_poll_secs must be a number")?;
+        if poll > SUBSTRATE_MAX_WAIT_SECS {
+            poll = SUBSTRATE_MAX_WAIT_SECS;
+        }
         Ok(Cfg {
             bearer: variables::get("tenant_bearer")
                 .context("variable tenant_bearer not set")?,
@@ -66,9 +84,7 @@ impl Cfg {
             presence_max_age_secs: variables::get("presence_max_age_secs")?
                 .parse()
                 .context("presence_max_age_secs must be a number")?,
-            reqres_poll_secs: variables::get("reqres_poll_secs")?
-                .parse()
-                .context("reqres_poll_secs must be a number")?,
+            reqres_poll_secs: poll,
         })
     }
 }
@@ -106,7 +122,7 @@ async fn handle_inference(req: Request) -> Result<Response> {
     }
 
     let corr_id = format!("corr_{}", Uuid::new_v4().simple());
-    let req_queue = format!("inference.{}.req", normalize_model(&parsed.model));
+    let req_queue = format!("inference_req_{}", normalize_name(&parsed.model));
 
     if parsed.stream {
         let sub_id = create_subscription(&cfg, &corr_id).await?;
@@ -124,27 +140,23 @@ async fn handle_inference(req: Request) -> Result<Response> {
     }
 
     // req/res
-    let resp_queue = format!("inference.resp.{}", corr_id);
+    let resp_queue = format!("inference_resp_{}", corr_id);
     create_queue(&cfg, &resp_queue).await?;
     let publish_result =
         publish_request(&cfg, &req_queue, &corr_id, &parsed.model, &parsed.prompt, Some(&resp_queue))
             .await;
     if let Err(e) = publish_result {
-        // best-effort cleanup
         let _ = delete_queue(&cfg, &resp_queue).await;
         return Err(e);
     }
     let received = receive_one(&cfg, &resp_queue, cfg.reqres_poll_secs).await;
     let _ = delete_queue(&cfg, &resp_queue).await;
     match received {
-        Ok(Some(msg)) => {
-            let bytes = serde_json::to_vec(&msg.body)?;
-            Ok(Response::builder()
-                .status(200)
-                .header("content-type", "application/json")
-                .body(bytes)
-                .build())
-        }
+        Ok(Some(body_bytes)) => Ok(Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(body_bytes)
+            .build()),
         Ok(None) => Ok(text(504, "worker did not respond in time\n")),
         Err(e) => Ok(text(502, &format!("substrate error: {e}\n"))),
     }
@@ -152,14 +164,10 @@ async fn handle_inference(req: Request) -> Result<Response> {
 
 async fn handle_presence(req: Request) -> Result<Response> {
     let body = req.into_body();
-    // http_push delivers the topic message body. The substrate may wrap it in
-    // a payload envelope — accept either shape: bare PresenceMessage, or
-    // {"body": PresenceMessage} / {"data": PresenceMessage}.
-    let msg: PresenceMessage = parse_presence(&body)
+    let msg: PresenceMessage = serde_json::from_slice(&body)
         .map_err(|e| anyhow!("bad presence payload: {e}"))?;
-
     let store = Store::open_default()?;
-    let key = format!("presence:{}:{}", normalize_model(&msg.model), msg.worker_id);
+    let key = format!("presence:{}:{}", normalize_name(&msg.model), msg.worker_id);
     let record = PresenceRecord {
         worker_id: msg.worker_id,
         model: msg.model,
@@ -170,32 +178,12 @@ async fn handle_presence(req: Request) -> Result<Response> {
     Ok(text(200, "ok\n"))
 }
 
-fn parse_presence(bytes: &[u8]) -> Result<PresenceMessage> {
-    if let Ok(m) = serde_json::from_slice::<PresenceMessage>(bytes) {
-        return Ok(m);
-    }
-    let v: serde_json::Value = serde_json::from_slice(bytes)?;
-    for key in ["body", "data", "message"] {
-        if let Some(inner) = v.get(key) {
-            if let Ok(m) = serde_json::from_value::<PresenceMessage>(inner.clone()) {
-                return Ok(m);
-            }
-            if let Some(s) = inner.as_str() {
-                if let Ok(m) = serde_json::from_str::<PresenceMessage>(s) {
-                    return Ok(m);
-                }
-            }
-        }
-    }
-    Err(anyhow!("could not extract PresenceMessage from payload"))
-}
-
 fn pick_worker(
     store: &Store,
     model: &str,
     max_age_secs: u64,
 ) -> Result<Option<PresenceRecord>> {
-    let prefix = format!("presence:{}:", normalize_model(model));
+    let prefix = format!("presence:{}:", normalize_name(model));
     let now = now_secs();
     let mut best: Option<PresenceRecord> = None;
     for key in store.get_keys()? {
@@ -208,7 +196,6 @@ fn pick_worker(
         if now.saturating_sub(record.last_seen) > max_age_secs {
             continue;
         }
-        // Prefer most-recently-seen.
         if best.as_ref().map_or(true, |b| record.last_seen > b.last_seen) {
             best = Some(record);
         }
@@ -218,7 +205,7 @@ fn pick_worker(
 
 async fn create_subscription(cfg: &Cfg, corr_id: &str) -> Result<String> {
     let body = serde_json::json!({
-        "topic": "inference.responses",
+        "topic": RESPONSE_TOPIC,
         "filter": format!("inference.{}.>", corr_id),
         "delivery": {"type": "sse"}
     });
@@ -255,32 +242,32 @@ async fn publish_request(
 ) -> Result<()> {
     let item = WorkItem { corr_id, model, prompt, response_queue };
     let bytes = serde_json::to_vec(&item)?;
-    let url = format!("{}/queues/{}/send", cfg.base, queue);
+    let url = format!("{}/queues/{}/messages", cfg.base, queue);
     let req = Request::builder()
         .method(Method::Post)
         .uri(url)
         .header("authorization", format!("Bearer {}", cfg.bearer))
-        .header("content-type", "application/json")
+        .header("content-type", "application/octet-stream")
         .body(bytes)
         .build();
     let resp: Response = spin_sdk::http::send(req).await?;
-    if *resp.status() >= 300 {
+    let status: u16 = (*resp.status()).into();
+    if status >= 300 {
         return Err(anyhow!(
             "publish to {} returned {}: {}",
             queue,
-            resp.status(),
+            status,
             String::from_utf8_lossy(resp.body())
         ));
     }
     Ok(())
 }
 
-async fn receive_one(
-    cfg: &Cfg,
-    queue: &str,
-    wait_secs: u64,
-) -> Result<Option<QueueReceiveResponse>> {
-    let url = format!("{}/queues/{}/receive?wait={}", cfg.base, queue, wait_secs);
+/// Long-poll one message from the queue. Acks before returning.
+/// Returns the raw body bytes (after base64 decode), or None if the queue stayed empty.
+async fn receive_one(cfg: &Cfg, queue: &str, wait_secs: u64) -> Result<Option<Vec<u8>>> {
+    let wait = wait_secs.min(SUBSTRATE_MAX_WAIT_SECS);
+    let url = format!("{}/queues/{}/messages?wait={}", cfg.base, queue, wait);
     let req = Request::builder()
         .method(Method::Get)
         .uri(url)
@@ -288,9 +275,6 @@ async fn receive_one(
         .build();
     let resp: Response = spin_sdk::http::send(req).await?;
     let status: u16 = (*resp.status()).into();
-    if status == 204 || resp.body().is_empty() {
-        return Ok(None);
-    }
     if status >= 300 {
         return Err(anyhow!(
             "receive from {} returned {}: {}",
@@ -299,17 +283,39 @@ async fn receive_one(
             String::from_utf8_lossy(resp.body())
         ));
     }
-    let parsed: QueueReceiveResponse = serde_json::from_slice(resp.body())
-        .context("queue receive response shape")?;
-    // best-effort ack so the message clears
-    let ack_url = format!("{}/queues/{}/ack/{}", cfg.base, queue, parsed.ack_token);
-    let ack_req = Request::builder()
-        .method(Method::Post)
-        .uri(ack_url)
+    let parsed: ReceiveResponse =
+        serde_json::from_slice(resp.body()).context("queue receive shape")?;
+    if parsed.count == 0 || parsed.messages.is_empty() {
+        return Ok(None);
+    }
+    // Take the first message, ack it. (Receive can return multiple; for v0.1
+    // req/res, we only expect one because the response queue is per-corr-id.)
+    let msg = parsed.messages.into_iter().next().unwrap();
+    let body_bytes = base64::engine::general_purpose::STANDARD
+        .decode(msg.body_b64.as_bytes())
+        .context("body_b64 decode")?;
+    ack(cfg, queue, &msg.ack_token).await?;
+    Ok(Some(body_bytes))
+}
+
+async fn ack(cfg: &Cfg, queue: &str, ack_token: &str) -> Result<()> {
+    let url = format!("{}/queues/{}/messages/{}", cfg.base, queue, ack_token);
+    let req = Request::builder()
+        .method(Method::Delete)
+        .uri(url)
         .header("authorization", format!("Bearer {}", cfg.bearer))
         .build();
-    let _: Response = spin_sdk::http::send(ack_req).await?;
-    Ok(Some(parsed))
+    let resp: Response = spin_sdk::http::send(req).await?;
+    let status: u16 = (*resp.status()).into();
+    if status >= 300 {
+        return Err(anyhow!(
+            "ack on {} returned {}: {}",
+            queue,
+            status,
+            String::from_utf8_lossy(resp.body())
+        ));
+    }
+    Ok(())
 }
 
 async fn post_json(cfg: &Cfg, path: &str, body: &serde_json::Value) -> Result<Vec<u8>> {
@@ -343,18 +349,21 @@ fn text(status: u16, msg: &str) -> Response {
         .build()
 }
 
-fn normalize_model(model: &str) -> String {
-    model
-        .chars()
+/// Normalize a free-form name (model, etc.) to the substrate's queue/topic name rule
+/// `[A-Za-z0-9_-]{1,64}` — every disallowed char becomes `-`.
+fn normalize_name(s: &str) -> String {
+    s.chars()
         .map(|c| match c {
-            ':' | '.' | '/' | ' ' => '-',
-            _ => c,
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '-' => c,
+            _ => '-',
         })
+        .collect::<String>()
+        .chars()
+        .take(64)
         .collect()
 }
 
 fn now_secs() -> u64 {
-    // Spin/WASI: SystemTime::now() works inside components on FWF.
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

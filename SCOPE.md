@@ -13,6 +13,7 @@ Show that a customer can keep their inference runtime under their own control wh
 ## v0.1 exit criteria (locked 2026-05-28)
 
 - [x] Architecture written up in `DECISIONS.md` (ADR-002) and `docs/architecture.md`
+- [x] Substrate wire shapes validated against the live service (`docs/validation.md`)
 - [ ] One inference worker class running end-to-end: local Ollama (`llama3.2:1b`)
 - [ ] Request router as a Spin function on FWF (Rust, `wasm32-wasip1`)
 - [ ] Hostname routed via Akamai (`inference.connected-cloud.io`) — deferred to deploy step

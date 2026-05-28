@@ -25,17 +25,17 @@ Architecture Decision Records. Add one entry per non-trivial choice.
 **Alternatives considered**: Custom queue-group + custom presence bucket (chose this for v0.1 — what we ended up doing).
 
 ## ADR-002: v0.1 architecture — Spin router + HTTP-only substrate + topic-based responses
-**Status**: accepted
+**Status**: accepted (substrate behavior validated 2026-05-28 — see `docs/validation.md`)
 **Date**: 2026-05-28
 **Context**: Need to land a working end-to-end demo. Substrate HTTP API at `mq.connected-cloud.io` exposes queues, topics, subscriptions, SSE — but no native NATS, no public KV, no per-key TTL.
 **Decision**:
 - **Router** is a single Spin function (Rust, `wasm32-wasip1`) on FWF behind `inference.connected-cloud.io`. Stateless per request. Reads ephemeral presence state from the Spin default KV store.
-- **Work fanout** uses queues (`inference.{model}.req`) — gives the queue-group exactly-once-handler property we need.
-- **Streaming responses** use a shared topic `inference.responses` with subjects `inference.<corr_id>.token|done|error`. Filtered subscriptions give per-request fan-out without queue-quota blowup.
-- **Streaming shape**: router creates SSE subscription, returns `302` to `https://mq.connected-cloud.io/v1/subscriptions/<id>/stream?bearer=…`. Browser holds the connection directly to the substrate, bypassing FWF wall-clock.
-- **req/res shape**: router creates an ephemeral per-corr-id queue `inference.resp.<corr_id>`, publishes work, long-polls the queue, returns JSON, deletes the queue. Bounded by FWF 30s wall-clock.
+- **Work fanout** uses queues — gives the queue-group exactly-once-handler property we need. Queue per model: `inference_req_<normalized_model>`. (Substrate name rule `[A-Za-z0-9_-]{1,64}` forbids dots in names.)
+- **Streaming responses** use a shared topic `inference_responses` with subjects `inference.<corr_id>.token|done|error` (dots are fine in subjects). Filtered subscriptions give per-request fan-out without queue-quota blowup.
+- **Streaming shape**: router creates SSE subscription, returns `302` to `…/subscriptions/<id>/stream?bearer=…`. Browser holds the connection directly to the substrate, bypassing FWF wall-clock. SSE subscriptions buffer pre-connect messages, so create-sub→publish-work→302→connect is race-free.
+- **req/res shape**: router creates an ephemeral per-corr-id queue `inference_resp_<corr_id>`, publishes work, long-polls the queue (max 20s), returns the message body as JSON, deletes the queue. Bounded by FWF 30s wall-clock.
 - **Worker dual-publish**: workers always publish tokens + done to the response topic; when `response_queue` is set in the work item, they ALSO publish the assembled response to that queue. Worker code doesn't branch on streaming vs req/res — the router decides by whether it provisioned a queue.
-- **Presence**: workers publish heartbeats (every 10s, subject `worker.<id>.<model>`) to a topic `worker.presence`. A long-lived `http_push` subscription forwards each heartbeat to `POST /v1/internal/presence` on the router, which upserts `{model, worker_id, last_seen}` into Spin KV. Router reads on dispatch; entries with `last_seen > 30s` ago are treated as gone.
+- **Presence**: workers publish heartbeats (every 10s, subject `presence.<id>.<normalized_model>`) to topic `worker_presence`. A long-lived `http_push` subscription forwards each heartbeat (raw body, headers `x-mq-subject|topic|id|attempt|timestamp`) to `POST /v1/internal/presence` on the router, which upserts `{model, worker_id, last_seen}` into Spin KV. Router reads on dispatch; entries older than 30s are treated as gone.
 **Rationale**:
 - Topic+filter is the only response shape that scales without burning queues per request (50-queue quota).
 - Spin KV is the only stateful primitive available to a FWF function for the presence snapshot (no native KV REST in substrate).

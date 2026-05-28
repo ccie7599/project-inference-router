@@ -2,11 +2,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use base64::Engine;
 use clap::Parser;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+const RESPONSE_TOPIC: &str = "inference_responses";
+const PRESENCE_TOPIC: &str = "worker_presence";
+const SUBSTRATE_MAX_WAIT_SECS: u64 = 20;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -14,27 +19,21 @@ use uuid::Uuid;
     about = "Ollama-backed inference worker for project-inference-router"
 )]
 struct Args {
-    /// Tenant bearer for mq.connected-cloud.io. Defaults to ../.tenant-bearer.
     #[arg(long, env = "TENANT_BEARER")]
     bearer: Option<String>,
 
-    /// Substrate base URL.
     #[arg(long, env = "SUBSTRATE_BASE", default_value = "https://mq.connected-cloud.io/v1")]
     substrate_base: String,
 
-    /// Model name the router uses to address us.
     #[arg(long, env = "MODEL", default_value = "llama3.2:1b")]
     model: String,
 
-    /// Ollama base URL.
     #[arg(long, env = "OLLAMA_BASE", default_value = "http://localhost:11434")]
     ollama_base: String,
 
-    /// Logical region (informational).
     #[arg(long, env = "REGION", default_value = "local-dev")]
     region: String,
 
-    /// Heartbeat interval seconds.
     #[arg(long, env = "HEARTBEAT_SECS", default_value_t = 10)]
     heartbeat_secs: u64,
 }
@@ -62,9 +61,17 @@ struct WorkItem {
 }
 
 #[derive(Deserialize)]
-struct WorkEnvelope {
-    body: serde_json::Value,
+struct ReceiveResponse {
+    #[serde(default)]
+    count: u32,
+    #[serde(default)]
+    messages: Vec<ReceivedMessage>,
+}
+
+#[derive(Deserialize)]
+struct ReceivedMessage {
     ack_token: String,
+    body_b64: String,
 }
 
 #[derive(Serialize)]
@@ -122,8 +129,8 @@ async fn main() -> Result<()> {
         .trim()
         .to_string();
 
-    let normalized_model = normalize_model(&args.model);
-    let queue = format!("inference.{}.req", normalized_model);
+    let normalized_model = normalize_name(&args.model);
+    let queue = format!("inference_req_{}", normalized_model);
     let worker_id = format!("wkr_{}", Uuid::new_v4().simple());
 
     let cfg = Arc::new(Cfg {
@@ -131,7 +138,7 @@ async fn main() -> Result<()> {
         base: args.substrate_base.trim_end_matches('/').to_string(),
         model: args.model,
         normalized_model,
-        queue: queue.clone(),
+        queue,
         ollama_base: args.ollama_base.trim_end_matches('/').to_string(),
         region: args.region,
         worker_id,
@@ -173,17 +180,16 @@ fn load_bearer_from_disk() -> Result<String> {
 }
 
 async fn ensure_resources(cfg: &Cfg) -> Result<()> {
-    // Worker creates its own request queue + the shared response topic + presence topic.
-    // Idempotent: 409 means already exists, treat as success.
-    let client = client(cfg)?;
-    create_queue(&client, cfg, &cfg.queue).await?;
-    create_topic(&client, cfg, "inference.responses").await?;
-    create_topic(&client, cfg, "worker.presence").await?;
+    // Idempotent: substrate returns 201 for both first and subsequent create.
+    let client = client()?;
+    create_resource(&client, cfg, "/queues", &cfg.queue).await?;
+    create_resource(&client, cfg, "/topics", RESPONSE_TOPIC).await?;
+    create_resource(&client, cfg, "/topics", PRESENCE_TOPIC).await?;
     Ok(())
 }
 
 async fn heartbeat_loop(cfg: Arc<Cfg>, interval_secs: u64) -> Result<()> {
-    let client = client(&cfg)?;
+    let client = client()?;
     let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -201,13 +207,13 @@ async fn publish_heartbeat(client: &reqwest::Client, cfg: &Cfg) -> Result<()> {
         region: &cfg.region,
         ts: now_secs(),
     };
-    let url = format!("{}/topics/worker.presence/publish", cfg.base);
+    let url = format!("{}/topics/{}/publish", cfg.base, PRESENCE_TOPIC);
     let resp = client
         .post(url)
         .bearer_auth(&cfg.bearer)
         .header(
             "X-MQ-Subject",
-            format!("worker.{}.{}", cfg.worker_id, cfg.normalized_model),
+            format!("presence.{}.{}", cfg.worker_id, cfg.normalized_model),
         )
         .json(&hb)
         .send()
@@ -221,19 +227,20 @@ async fn publish_heartbeat(client: &reqwest::Client, cfg: &Cfg) -> Result<()> {
 }
 
 async fn consume_loop(cfg: Arc<Cfg>) -> Result<()> {
-    let client = client(&cfg)?;
+    let client = client()?;
     loop {
-        match receive_one(&client, &cfg).await {
-            Ok(Some(envelope)) => {
-                let cfg = cfg.clone();
-                let client = client.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_envelope(&client, &cfg, envelope).await {
-                        error!(error = ?e, "request handling failed");
-                    }
-                });
+        match receive_messages(&client, &cfg).await {
+            Ok(messages) => {
+                for msg in messages {
+                    let cfg = cfg.clone();
+                    let client = client.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_message(&client, &cfg, msg).await {
+                            error!(error = ?e, "request handling failed");
+                        }
+                    });
+                }
             }
-            Ok(None) => {} // no message; loop and long-poll again
             Err(e) => {
                 warn!(error = ?e, "receive failed, backing off");
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -242,52 +249,51 @@ async fn consume_loop(cfg: Arc<Cfg>) -> Result<()> {
     }
 }
 
-async fn receive_one(client: &reqwest::Client, cfg: &Cfg) -> Result<Option<WorkEnvelope>> {
-    let url = format!("{}/queues/{}/receive?wait=30", cfg.base, cfg.queue);
+async fn receive_messages(
+    client: &reqwest::Client,
+    cfg: &Cfg,
+) -> Result<Vec<ReceivedMessage>> {
+    let url = format!(
+        "{}/queues/{}/messages?wait={}",
+        cfg.base, cfg.queue, SUBSTRATE_MAX_WAIT_SECS
+    );
     let resp = client.get(url).bearer_auth(&cfg.bearer).send().await?;
     let status = resp.status();
-    if status == reqwest::StatusCode::NO_CONTENT {
-        return Ok(None);
-    }
     let bytes = resp.bytes().await?;
-    if bytes.is_empty() {
-        return Ok(None);
-    }
     if !status.is_success() {
         return Err(anyhow!("receive {}: {}", status, String::from_utf8_lossy(&bytes)));
     }
-    let envelope: WorkEnvelope = serde_json::from_slice(&bytes)
-        .context("queue receive envelope shape")?;
-    Ok(Some(envelope))
+    let parsed: ReceiveResponse =
+        serde_json::from_slice(&bytes).context("queue receive shape")?;
+    if parsed.count == 0 {
+        return Ok(vec![]);
+    }
+    Ok(parsed.messages)
 }
 
-async fn handle_envelope(
+async fn handle_message(
     client: &reqwest::Client,
     cfg: &Cfg,
-    envelope: WorkEnvelope,
+    msg: ReceivedMessage,
 ) -> Result<()> {
-    let item: WorkItem = serde_json::from_value(envelope.body.clone())
-        .or_else(|_| {
-            // body may arrive as a JSON string; double-decode if so
-            if let Some(s) = envelope.body.as_str() {
-                serde_json::from_str::<WorkItem>(s)
-            } else {
-                Err(serde::de::Error::custom("not parsable as WorkItem"))
-            }
-        })
-        .context("decoding work item")?;
+    let body_bytes = base64::engine::general_purpose::STANDARD
+        .decode(msg.body_b64.as_bytes())
+        .context("body_b64 decode")?;
+    let item: WorkItem = serde_json::from_slice(&body_bytes).context("decoding work item")?;
 
     info!(corr_id = %item.corr_id, "received request");
 
     let result = run_inference(client, cfg, &item).await;
-    match result {
-        Ok(()) => info!(corr_id = %item.corr_id, "request complete"),
-        Err(ref e) => {
-            error!(corr_id = %item.corr_id, error = ?e, "inference failed");
-            let _ = publish_error(client, cfg, &item, &e.to_string()).await;
-        }
+    if let Err(ref e) = result {
+        error!(corr_id = %item.corr_id, error = ?e, "inference failed");
+        let _ = publish_error(client, cfg, &item, &e.to_string()).await;
+    } else {
+        info!(corr_id = %item.corr_id, "request complete");
     }
-    let _ = ack(client, cfg, &envelope.ack_token).await;
+    // Ack regardless of inference success — we don't redrive a bad request.
+    if let Err(e) = ack(client, cfg, &msg.ack_token).await {
+        warn!(error = ?e, "ack failed");
+    }
     result
 }
 
@@ -319,7 +325,7 @@ async fn run_inference(
         buf.extend_from_slice(&chunk);
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buf.drain(..=pos).collect();
-            let line = &line[..line.len() - 1]; // drop newline
+            let line = &line[..line.len() - 1];
             if line.is_empty() {
                 continue;
             }
@@ -352,7 +358,7 @@ async fn run_inference(
             response: &accumulator,
             tokens: token_count,
         };
-        send_to_queue(client, cfg, rq, &serde_json::to_value(&final_msg)?).await?;
+        send_to_queue(client, cfg, rq, &serde_json::to_vec(&final_msg)?).await?;
     }
     Ok(())
 }
@@ -409,7 +415,7 @@ async fn publish_error(
             model: &cfg.model,
             error: err,
         };
-        send_to_queue(client, cfg, rq, &serde_json::to_value(&payload)?).await?;
+        send_to_queue(client, cfg, rq, &serde_json::to_vec(&payload)?).await?;
     }
     Ok(())
 }
@@ -421,7 +427,7 @@ async fn publish_to_responses(
     leaf: &str,
     body: &serde_json::Value,
 ) -> Result<()> {
-    let url = format!("{}/topics/inference.responses/publish", cfg.base);
+    let url = format!("{}/topics/{}/publish", cfg.base, RESPONSE_TOPIC);
     let subject = format!("inference.{}.{}", corr_id, leaf);
     let resp = client
         .post(url)
@@ -442,13 +448,14 @@ async fn send_to_queue(
     client: &reqwest::Client,
     cfg: &Cfg,
     queue: &str,
-    body: &serde_json::Value,
+    body: &[u8],
 ) -> Result<()> {
-    let url = format!("{}/queues/{}/send", cfg.base, queue);
+    let url = format!("{}/queues/{}/messages", cfg.base, queue);
     let resp = client
         .post(url)
         .bearer_auth(&cfg.bearer)
-        .json(body)
+        .header("content-type", "application/octet-stream")
+        .body(body.to_vec())
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -460,8 +467,8 @@ async fn send_to_queue(
 }
 
 async fn ack(client: &reqwest::Client, cfg: &Cfg, token: &str) -> Result<()> {
-    let url = format!("{}/queues/{}/ack/{}", cfg.base, cfg.queue, token);
-    let resp = client.post(url).bearer_auth(&cfg.bearer).send().await?;
+    let url = format!("{}/queues/{}/messages/{}", cfg.base, cfg.queue, token);
+    let resp = client.delete(url).bearer_auth(&cfg.bearer).send().await?;
     if !resp.status().is_success() {
         let s = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -470,15 +477,7 @@ async fn ack(client: &reqwest::Client, cfg: &Cfg, token: &str) -> Result<()> {
     Ok(())
 }
 
-async fn create_queue(client: &reqwest::Client, cfg: &Cfg, name: &str) -> Result<()> {
-    create_named(client, cfg, "/queues", name).await
-}
-
-async fn create_topic(client: &reqwest::Client, cfg: &Cfg, name: &str) -> Result<()> {
-    create_named(client, cfg, "/topics", name).await
-}
-
-async fn create_named(
+async fn create_resource(
     client: &reqwest::Client,
     cfg: &Cfg,
     path: &str,
@@ -491,15 +490,15 @@ async fn create_named(
         .json(&serde_json::json!({ "name": name }))
         .send()
         .await?;
-    let status = resp.status();
-    if status.is_success() || status == reqwest::StatusCode::CONFLICT {
+    if resp.status().is_success() {
         return Ok(());
     }
+    let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     Err(anyhow!("create {} {}: {}: {}", path, name, status, body))
 }
 
-fn client(_cfg: &Cfg) -> Result<reqwest::Client> {
+fn client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("inference-router-worker/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(120))
@@ -508,13 +507,15 @@ fn client(_cfg: &Cfg) -> Result<reqwest::Client> {
         .context("building http client")
 }
 
-fn normalize_model(model: &str) -> String {
-    model
-        .chars()
+fn normalize_name(s: &str) -> String {
+    s.chars()
         .map(|c| match c {
-            ':' | '.' | '/' | ' ' => '-',
-            _ => c,
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '-' => c,
+            _ => '-',
         })
+        .collect::<String>()
+        .chars()
+        .take(64)
         .collect()
 }
 

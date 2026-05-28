@@ -11,7 +11,7 @@ tenant_bearer    = { required = true }
 substrate_base   = { default = "https://mq.connected-cloud.io/v1" }
 default_region   = { default = "local-dev" }
 presence_max_age_secs = { default = "30" }
-reqres_poll_secs = { default = "25" }
+reqres_poll_secs = { default = "20" }
 
 [[trigger.http]]
 route = "/..."
